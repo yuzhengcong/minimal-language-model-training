@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+from typing import IO, Any, BinaryIO, Dict, Tuple
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from collections import defaultdict
+
 
 
 def run_linear(
@@ -589,4 +591,113 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    
+    # initialize the vocab_dict
+    
+    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+    # Add special tokens
+    special_token_bytes = [tok.encode("utf-8") for tok in special_tokens]
+    for tok_bytes in special_token_bytes:
+        if tok_bytes not in vocab.values():
+            vocab[len(vocab)] = tok_bytes
+    
+    print(vocab)
+
+    initial_vocab_size = len(vocab)
+    if initial_vocab_size >= vocab_size:
+        raise ValueError(f"{initial_vocab_size} larger than the givin size {vocab_size}")
+    
+    times_merged = vocab_size - initial_vocab_size
+    merges: list[tuple[bytes, bytes]] = []
+
+
+    # pretokenizer
+    pre_token_counts: dict[tuple[bytes, ...], int] = defaultdict(int)
+
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    with open(input_path, 'r', encoding="utf-8") as f:
+        for line in f:  
+            pre_tokens_str = re.findall(PAT, line)
+            
+            for tok_str in pre_tokens_str:
+                tok_bytes_seq = tuple(tok_str.encode("utf-8"))  # 如 "the" → (b't', b'h', b'e')
+                pre_token_counts[tok_bytes_seq] += 1
+    
+    pair_frequency = _count_byte_pair_frequencies(pre_token_counts)
+
+    
+
+    
+def _count_byte_pair_frequencies(pre_token_counts: dict[tuple[bytes, ...], int]) -> defaultdict[tuple[bytes, bytes], int]:
+    pair_freq: defaultdict[tuple[bytes, bytes], int] = defaultdict(int)
+
+    for tok_seq, count in pre_token_counts.items():
+        if len(tok_seq) < 2:
+            continue
+
+        for i in range(len(tok_seq) - 1):
+            pair = (tok_seq[i], tok_seq[i+1])
+            pair_freq[pair] += count
+    
+    return pair_freq
+
+
+def _merge_pair_frequencies(
+    pre_token_counts: Dict[Tuple[bytes, ...], int],
+    pair_freq: defaultdict[Tuple[bytes, bytes], int],
+    merge_times: int
+) -> Tuple[Dict[Tuple[bytes, ...], int], defaultdict[Tuple[bytes, bytes], int], list[Tuple[bytes, bytes]]]:
+    
+    new_pre_token_counts = pre_token_counts.copy() 
+    new_pair_freq = pair_freq.copy()               
+    merges: list[Tuple[bytes, bytes]] = []        
+
+
+    
+    for _ in range(merge_times):
+        if not new_pair_freq:
+            raise ValueError("没有更多可合并的字节对，但未完成指定合并次数")
+        
+        # 步骤1：找到频率最高的字节对（频率相同则按字典序选更大的对，作业2.4节要求）
+        # 排序规则：-x[1]（频率降序），x[0]（字节对字典序升序）
+        sorted_pairs = sorted(new_pair_freq.items(), key=lambda x: (-x[1], x[0]))
+        best_pair = sorted_pairs[0][0]  # (token1, token2)，例如 (b's', b't')
+        token1, token2 = best_pair
+        merges.append(best_pair)        # 记录本次合并
+        
+        # 步骤2：更新预令牌：将所有包含 (token1, token2) 的序列替换为新令牌 token1+token2
+        updated_pre_tokens = defaultdict(int)
+        for tok_seq, count in new_pre_token_counts.items():
+            if len(tok_seq) < 2:
+                updated_pre_tokens[tok_seq] += count
+                continue
+            
+            # 遍历当前预令牌序列，替换所有 (token1, token2) 为新令牌
+            new_tok_seq = []
+            i = 0
+            while i < len(tok_seq):
+                # 找到 token1 + token2 的位置，合并为新令牌
+                if i < len(tok_seq) - 1 and tok_seq[i] == token1 and tok_seq[i+1] == token2:
+                    new_tok = token1 + token2  # 合并后的新令牌（字节拼接）
+                    new_tok_seq.append(new_tok)
+                    i += 2  # 跳过下一个token（已合并）
+                else:
+                    new_tok_seq.append(tok_seq[i])
+                    i += 1
+            
+            # 累加更新后的预令牌计数
+            updated_pre_tokens[tuple(new_tok_seq)] += count
+        
+        # 步骤3：更新预令牌计数和字节对频率
+        new_pre_token_counts = dict(updated_pre_tokens)
+        new_pair_freq = _count_byte_pair_frequencies(new_pre_token_counts)
+    
+    return new_pre_token_counts, new_pair_freq, merges
+    
+
+        
+    
+
+
+
