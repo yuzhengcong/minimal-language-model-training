@@ -2,13 +2,74 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+import regex as re
 from typing import IO, Any, BinaryIO, Dict, Tuple
+from multiprocessing import Pool
 
 import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from collections import defaultdict
+
+
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """Chunk the file into parts that can be counted independently."""
+    assert isinstance(split_special_token, bytes)
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+    chunk_size = file_size // desired_num_chunks
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+    mini_chunk_size = 4096
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)
+        while True:
+            mini_chunk = file.read(mini_chunk_size)
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+    return sorted(set(chunk_boundaries))
+
+
+def _pretokenize_chunk(args: tuple) -> dict[tuple[bytes, ...], int]:
+    """Worker function: pre-tokenize a single chunk of the file."""
+    input_path, start, end, special_tokens = args
+    local_counts: dict[tuple[bytes, ...], int] = defaultdict(int)
+
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+
+    if special_tokens:
+        special_split_pattern = "|".join(re.escape(tok) for tok in special_tokens)
+        segments = re.split(special_split_pattern, chunk)
+    else:
+        segments = [chunk]
+
+    for segment in segments:
+        if not segment:
+            continue
+        for match in re.finditer(PAT, segment):
+            tok_str = match.group()
+            tok_bytes_seq = tuple(bytes([b]) for b in tok_str.encode("utf-8"))
+            local_counts[tok_bytes_seq] += 1
+
+    return dict(local_counts)
 
 
 
@@ -592,6 +653,7 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
     
+
     # initialize the vocab_dict
     
     vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
@@ -601,34 +663,62 @@ def run_train_bpe(
         if tok_bytes not in vocab.values():
             vocab[len(vocab)] = tok_bytes
     
-    print(vocab)
-
     initial_vocab_size = len(vocab)
     if initial_vocab_size >= vocab_size:
         raise ValueError(f"{initial_vocab_size} larger than the givin size {vocab_size}")
     
+    # merge info
     times_merged = vocab_size - initial_vocab_size
     merges: list[tuple[bytes, bytes]] = []
 
 
-    # pretokenizer
+    # Parallel pre-tokenization using chunk boundaries
     pre_token_counts: dict[tuple[bytes, ...], int] = defaultdict(int)
 
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    split_special_token = special_tokens[0].encode("utf-8") if special_tokens else None
+    num_processes = os.cpu_count() or 1
 
-    with open(input_path, 'r', encoding="utf-8") as f:
-        for line in f:  
-            pre_tokens_str = re.findall(PAT, line)
-            
-            for tok_str in pre_tokens_str:
-                tok_bytes_seq = tuple(tok_str.encode("utf-8"))  # 如 "the" → (b't', b'h', b'e')
-                pre_token_counts[tok_bytes_seq] += 1
+    with open(input_path, "rb") as f:
+        if split_special_token:
+            boundaries = find_chunk_boundaries(f, num_processes, split_special_token)
+        else:
+            f.seek(0, os.SEEK_END)
+            boundaries = [0, f.tell()]
+
+    chunk_args = [
+        (str(input_path), start, end, special_tokens)
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
+
+    with Pool(processes=len(chunk_args)) as pool:
+        results = pool.map(_pretokenize_chunk, chunk_args)
+
+    for local_counts in results:
+        for tok_seq, count in local_counts.items():
+            pre_token_counts[tok_seq] += count
     
+    # print(pre_token_counts)
     pair_frequency = _count_byte_pair_frequencies(pre_token_counts)
 
-    
+    new_pre_token_counts, new_pair_freq, merges = _merge_pair_frequencies(
+        pre_token_counts, 
+        pair_frequency, 
+        times_merged
+    )
 
-    
+    for merge_pair in merges:
+        # 合并后的新令牌 = token1 + token2（字节拼接）
+        new_token = merge_pair[0] + merge_pair[1]
+        # 新令牌ID = 当前词汇表长度（递增）
+        new_token_id = len(vocab)
+        vocab[new_token_id] = new_token
+
+    return vocab, merges
+
+
+
+
+
 def _count_byte_pair_frequencies(pre_token_counts: dict[tuple[bytes, ...], int]) -> defaultdict[tuple[bytes, bytes], int]:
     pair_freq: defaultdict[tuple[bytes, bytes], int] = defaultdict(int)
 
@@ -659,14 +749,13 @@ def _merge_pair_frequencies(
         if not new_pair_freq:
             raise ValueError("没有更多可合并的字节对，但未完成指定合并次数")
         
-        # 步骤1：找到频率最高的字节对（频率相同则按字典序选更大的对，作业2.4节要求）
-        # 排序规则：-x[1]（频率降序），x[0]（字节对字典序升序）
-        sorted_pairs = sorted(new_pair_freq.items(), key=lambda x: (-x[1], x[0]))
+        # Step1: find the most frequent pairs
+        sorted_pairs = sorted(new_pair_freq.items(), key=lambda x: (x[1], x[0]), reverse= True)
         best_pair = sorted_pairs[0][0]  # (token1, token2)，例如 (b's', b't')
         token1, token2 = best_pair
         merges.append(best_pair)        # 记录本次合并
         
-        # 步骤2：更新预令牌：将所有包含 (token1, token2) 的序列替换为新令牌 token1+token2
+        # Step2: update (token1, token2) to token1+token2
         updated_pre_tokens = defaultdict(int)
         for tok_seq, count in new_pre_token_counts.items():
             if len(tok_seq) < 2:
@@ -679,9 +768,9 @@ def _merge_pair_frequencies(
             while i < len(tok_seq):
                 # 找到 token1 + token2 的位置，合并为新令牌
                 if i < len(tok_seq) - 1 and tok_seq[i] == token1 and tok_seq[i+1] == token2:
-                    new_tok = token1 + token2  # 合并后的新令牌（字节拼接）
+                    new_tok = token1 + token2  # (b'st')
                     new_tok_seq.append(new_tok)
-                    i += 2  # 跳过下一个token（已合并）
+                    i += 2  # 
                 else:
                     new_tok_seq.append(tok_seq[i])
                     i += 1
@@ -689,7 +778,7 @@ def _merge_pair_frequencies(
             # 累加更新后的预令牌计数
             updated_pre_tokens[tuple(new_tok_seq)] += count
         
-        # 步骤3：更新预令牌计数和字节对频率
+        # Step3: update the pair_freq and pre_token_counts
         new_pre_token_counts = dict(updated_pre_tokens)
         new_pair_freq = _count_byte_pair_frequencies(new_pre_token_counts)
     
