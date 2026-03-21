@@ -522,7 +522,7 @@ def run_load_checkpoint(
     src: str | os.PathLike | BinaryIO | IO[bytes],
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-):
+) -> int:
     """
     Given a serialized checkpoint (path or file-like object), restore the
     serialized state to the given model and optimizer.
@@ -562,6 +562,19 @@ def get_tokenizer(
     raise NotImplementedError
 
 
+def _pretokenize_chunk(args: tuple) -> dict:
+    import regex as re
+    from collections import Counter
+    start, end, input_path, pat, special_tokens = args
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+    special_pat = "(" + "|".join(re.escape(t) for t in special_tokens) + ")" if special_tokens else None
+    chunks = re.split(special_pat, chunk) if special_pat else [chunk]
+    words = [w for c in chunks if c not in special_tokens for w in re.findall(pat, c)]
+    return Counter(tuple(bytes([b]) for b in word.encode("utf-8")) for word in words)
+
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -589,4 +602,88 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+   
+    # Vocabulary initialization
+    vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+
+
+    from collections import Counter
+    from multiprocessing import Pool
+    from cs336_basics.pretokenization_example import find_chunk_boundaries
+
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    num_processes = os.cpu_count() or 4
+
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+
+    args = [(s, e, input_path, PAT, special_tokens) for s, e in zip(boundaries[:-1], boundaries[1:])]
+    with Pool(num_processes) as pool:
+        results = pool.map(_pretokenize_chunk, args)
+
+    word_freqs: dict[tuple[bytes, ...], int] = Counter()
+    for r in results:
+        word_freqs.update(r)
+
+    merges: list[tuple[bytes, bytes]] = []
+
+    # Special tokens: add to vocab first
+    for token in special_tokens:
+        vocab[len(vocab)] = token.encode("utf-8")
+
+    # Build pair_counts and reverse index once
+    pair_counts: Counter = Counter()
+    pair_to_seqs: dict = {}
+    for token_seq, freq in word_freqs.items():
+        for pair in zip(token_seq, token_seq[1:]):
+            pair_counts[pair] += freq
+            if pair not in pair_to_seqs:
+                pair_to_seqs[pair] = set()
+            pair_to_seqs[pair].add(token_seq)
+
+    while len(vocab) < vocab_size:
+        # 1. Best pair: highest count, tie-break lexicographically
+        best_pair = max(pair_counts, key=lambda p: (pair_counts[p], p))
+        merged = best_pair[0] + best_pair[1]
+
+        # 2. Only process sequences that contain best_pair
+        affected = list(pair_to_seqs.pop(best_pair, []))
+        for old_seq in affected:
+            if old_seq not in word_freqs:
+                continue
+            freq = word_freqs.pop(old_seq)
+
+            # Remove old pair contributions from this sequence
+            for pair in zip(old_seq, old_seq[1:]):
+                pair_counts[pair] -= freq
+                pair_to_seqs.get(pair, set()).discard(old_seq)
+
+            # Build merged sequence
+            new_seq = []
+            i = 0
+            while i < len(old_seq):
+                if i < len(old_seq) - 1 and old_seq[i] == best_pair[0] and old_seq[i + 1] == best_pair[1]:
+                    new_seq.append(merged)
+                    i += 2
+                else:
+                    new_seq.append(old_seq[i])
+                    i += 1
+            new_seq = tuple(new_seq)
+
+            # Add new pair contributions
+            word_freqs[new_seq] = word_freqs.get(new_seq, 0) + freq
+            for pair in zip(new_seq, new_seq[1:]):
+                pair_counts[pair] += freq
+                if pair not in pair_to_seqs:
+                    pair_to_seqs[pair] = set()
+                pair_to_seqs[pair].add(new_seq)
+
+        # 3. Record merge and update vocab
+        merges.append(best_pair)
+        vocab[len(vocab)] = merged
+
+
+
+
+
+    return vocab, merges
