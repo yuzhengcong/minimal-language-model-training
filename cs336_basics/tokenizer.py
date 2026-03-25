@@ -5,6 +5,7 @@ import regex as re
 
 class Tokenizer:
     def __init__(self, vocab, merges, special_tokens=None):
+        
         """
         Construct a tokenizer from a given vocabulary, list of merges, and (optionally) a list of special tokens. 
         This function should accept the following parameters:

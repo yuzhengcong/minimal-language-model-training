@@ -28,8 +28,12 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
+    from cs336_basics.linear import Linear
 
-    raise NotImplementedError
+    model = Linear(d_in, d_out)
+    model.load_state_dict({"W": weights})
+
+    return model(in_features)
 
 
 def run_embedding(
@@ -50,7 +54,12 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
+    from cs336_basics.embedding import Embedding
+    
+    model = Embedding(vocab_size, d_model)
+    model.load_state_dict({"W": weights})
 
+    return model(token_ids)
     raise NotImplementedError
 
 
@@ -76,14 +85,15 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    from cs336_basics.swiglu import SwiGLU
+
+    model = SwiGLU(d_model, d_ff)
+    # 手动赋值权重（W 是我们 Linear 里的参数名）
+    model.w1.W.data = w1_weight
+    model.w2.W.data = w2_weight
+    model.w3.W.data = w3_weight
+
+    return model(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -378,7 +388,12 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    from cs336_basics.rmsnorm import RMSNorm
+    rmsnorm = RMSNorm(d_model, eps)
+    rmsnorm.load_state_dict({"g": weights})
+
+    return rmsnorm(in_features)
+
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -559,7 +574,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    from tests.tokenizer import Tokenizer
+    from cs336_basics.tokenizer import Tokenizer
     return Tokenizer(vocab, merges, special_tokens)
 
 
@@ -610,7 +625,7 @@ def run_train_bpe(
 
     from collections import Counter
     from multiprocessing import Pool
-    from cs336_basics.pretokenization_example import find_chunk_boundaries
+    from cs336_basics.pretokenization import find_chunk_boundaries
 
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     num_processes = os.cpu_count() or 4
